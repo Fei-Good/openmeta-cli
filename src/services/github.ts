@@ -23,6 +23,7 @@ const ACTION_BLOCKING_LABELS = [
 const SEARCH_RESULTS_PER_PAGE = 30;
 const SEARCH_CACHE_TTL_MS = 10 * 60 * 1000;
 const MAX_PAGINATION_RETRIES = 3;
+const MAX_SEARCH_PAGES = 8;
 const RATE_LIMIT_RETRY_BASE_DELAY_MS = 1000;
 
 type SearchIssueItem =
@@ -343,10 +344,12 @@ export class GitHubService {
       throw new Error('GitHub service not initialized');
     }
 
+    const items: SearchIssueItem[] = [];
     let attempt = 0;
+    let pagesFetched = 0;
+
     while (attempt < MAX_PAGINATION_RETRIES) {
       try {
-        const items: SearchIssueItem[] = [];
         for await (const response of this.octokit.paginate.iterator(
           this.octokit.rest.search.issuesAndPullRequests,
           {
@@ -356,13 +359,17 @@ export class GitHubService {
             per_page: SEARCH_RESULTS_PER_PAGE,
           },
         )) {
-          // @octokit/plugin-paginate-rest normalizes the paginated responses.
-          // For search endpoints, it places the items array directly in response.data.
           const pageItems: SearchIssueItem[] = Array.isArray((response as any).data)
             ? (response as any).data
             : [];
-          
+
           items.push(...pageItems);
+          pagesFetched++;
+
+          if (pagesFetched >= MAX_SEARCH_PAGES) {
+            logger.debug(`Reached page limit (${MAX_SEARCH_PAGES}). Stopping pagination.`);
+            return items;
+          }
         }
         return items;
       } catch (error) {
@@ -370,21 +377,28 @@ export class GitHubService {
         const err = error as { status?: number; headers?: Record<string, string> };
         const isRateLimit = err.status === 403 || err.status === 429;
 
-        if (isRateLimit && attempt < MAX_PAGINATION_RETRIES) {
-          const resetHeader = err.headers?.['x-ratelimit-reset'];
-          let delayMs = RATE_LIMIT_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-
-          if (resetHeader) {
-            const resetTime = parseInt(resetHeader, 10) * 1000;
-            const waitMs = resetTime - Date.now();
-            if (waitMs > 0 && waitMs < 60_000) {
-              delayMs = Math.min(waitMs + 500, 60_000);
-            }
+        if (isRateLimit) {
+          if (items.length > 0) {
+            logger.warn(`Rate limited during pagination after fetching ${items.length} items. Returning partial results.`);
+            return items;
           }
 
-          logger.warn(`Rate limited during pagination (attempt ${attempt}/${MAX_PAGINATION_RETRIES}). Retrying in ${Math.round(delayMs / 1000)}s...`);
-          await this.delay(delayMs);
-          continue;
+          if (attempt < MAX_PAGINATION_RETRIES) {
+            const resetHeader = err.headers?.['x-ratelimit-reset'];
+            let delayMs = RATE_LIMIT_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+
+            if (resetHeader) {
+              const resetTime = parseInt(resetHeader, 10) * 1000;
+              const waitMs = resetTime - Date.now();
+              if (waitMs > 0) {
+                delayMs = Math.min(waitMs + 500, 60_000);
+              }
+            }
+
+            logger.warn(`Rate limited during pagination (attempt ${attempt}/${MAX_PAGINATION_RETRIES}). Retrying in ${Math.round(delayMs / 1000)}s...`);
+            await this.delay(delayMs);
+            continue;
+          }
         }
 
         throw error;
